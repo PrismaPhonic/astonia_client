@@ -7,6 +7,69 @@ pub fn build(b: *std.Build) void {
     const host = builtin.target;
     const optimize = b.standardOptimizeOption(.{});
 
+    const zlib_dep = b.dependency("zlib", .{
+        .target = resolved,
+        .optimize = optimize,
+    });
+    const zlib = zlib_dep.artifact("z");
+    zlib.want_lto = true; // Enable LTO
+    zlib.root_module.link_libc = true;
+
+    const libpng_dep = b.dependency("libpng", .{});
+    const png = b.addLibrary(.{
+        .name = "png",
+        .linkage = .static,
+        .root_module = b.createModule(.{
+            .target = resolved,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    png.want_lto = true; // Enable LTO
+    png.addIncludePath(libpng_dep.path(""));
+    if (tgt.os.tag == .linux) {
+        png.root_module.linkSystemLibrary("m", .{});
+    }
+    png.root_module.linkLibrary(zlib);
+
+    // Copy pnglibconf.h.prebuilt to pnglibconf.h
+    const wf = b.addWriteFiles();
+    const pnglibconf_h = wf.addCopyFile(libpng_dep.path("pnglibconf.h.prebuilt"), "pnglibconf.h");
+    png.addIncludePath(wf.getDirectory());
+    png.step.dependOn(&wf.step);
+    
+    inline for (pngSources) |source| {
+        png.addCSourceFile(.{ .file = libpng_dep.path(source) });
+    }
+
+    png.installHeader(pnglibconf_h, "pnglibconf.h");
+    inline for (pngHeaders) |header| {
+        png.installHeader(libpng_dep.path(header), header);
+    }
+    b.installArtifact(png);
+
+    // mimalloc - high performance allocator
+    const mimalloc_dep = b.dependency("mimalloc", .{});
+    const mimalloc = b.addLibrary(.{
+        .name = "mimalloc",
+        .linkage = .static,
+        .root_module = b.createModule(.{
+            .target = resolved,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    mimalloc.want_lto = true; // Enable LTO
+    mimalloc.addIncludePath(mimalloc_dep.path("include"));
+    
+    // Add mimalloc source - use static.c which includes all other files
+    const mimalloc_flags = &.{"-DMI_MALLOC_OVERRIDE"};
+    mimalloc.addCSourceFile(.{ .file = mimalloc_dep.path("src/static.c"), .flags = mimalloc_flags });
+    
+    // Install headers so we can include mimalloc-override.h
+    mimalloc.installHeadersDirectory(mimalloc_dep.path("include"), "", .{});
+    b.installArtifact(mimalloc);
+
     const include_root = "include";
     const src_root = "src";
 
@@ -22,12 +85,14 @@ pub fn build(b: *std.Build) void {
     cargo.step.dependOn(&rustup.step);
 
     const rust_out_dir = b.pathJoin(&.{ rust_crate_dir, "target", rust_target, "release" });
-    const rust_dyn_name = switch (tgt.os.tag) {
+    
+    // Linux uses static library, Windows uses dynamic
+    const rust_lib_name = switch (tgt.os.tag) {
         .windows => "astonia_net.dll",
-        .linux => "libastonia_net.so",
-        else => "libastonia_net.so",
+        .linux => "libastonia_net.a",
+        else => "libastonia_net.a",
     };
-    const rust_dyn_path = b.pathJoin(&.{ rust_out_dir, rust_dyn_name });
+    const rust_lib_path = b.pathJoin(&.{ rust_out_dir, rust_lib_name });
 
     const common_sources = &.{
         // GUI
@@ -76,6 +141,12 @@ pub fn build(b: *std.Build) void {
         "src/game/memory_linux.c",
     };
 
+    // Get mimalloc override header path for -include flag
+    const mimalloc_override_path = b.pathJoin(&.{
+        mimalloc_dep.path("include").getPath(b),
+        "mimalloc-override.h",
+    });
+
     const base_cflags = &.{
         "-O3",
         "-gdwarf-4",
@@ -84,6 +155,8 @@ pub fn build(b: *std.Build) void {
         "-Wno-char-subscripts",
         "-fno-omit-frame-pointer",
         "-fvisibility=hidden",
+        "-include",
+        mimalloc_override_path,
     };
 
     const win_cflags = &.{
@@ -99,6 +172,8 @@ pub fn build(b: *std.Build) void {
         "-DENABLE_CRASH_HANDLER",
         "-DENABLE_SHAREDMEM",
         "-DENABLE_DRAGHACK",
+        "-include",
+        mimalloc_override_path,
     };
 
     const exe = b.addExecutable(.{
@@ -109,6 +184,7 @@ pub fn build(b: *std.Build) void {
             .link_libc = true,
         }),
     });
+    exe.want_lto = true; // Enable LTO for whole program optimization
 
     addSearchPathsForWindowsTarget(b, exe, tgt, host);
 
@@ -139,35 +215,28 @@ pub fn build(b: *std.Build) void {
 
     exe.root_module.addIncludePath(b.path(include_root));
     exe.root_module.addIncludePath(b.path(src_root));
+    
+    // Add mimalloc include path and link it
+    exe.root_module.addIncludePath(mimalloc_dep.path("include"));
+    exe.root_module.linkLibrary(mimalloc);
 
     // Link libs (Makefile equivalent: -lwsock32 -lws2_32 -lz -lpng -lzip -ldwarfstack $(SDL_LIBS) -lSDL2_mixer)
-    linkCommonLibs(b, exe, tgt);
+    linkCommonLibs(b, exe, tgt, zlib, png);
 
     exe.step.dependOn(&cargo.step);
 
     if (tgt.os.tag == .linux) {
-        // Workaround: Copy library to current directory and link with relative path
-        // This avoids embedding absolute paths in NEEDED entries
-        const lib_copy_path = rust_dyn_name; // Copy to current directory
-
-        // Copy the library to current directory for linking
-        const copy_lib = b.addSystemCommand(&.{ "cp", rust_dyn_path, lib_copy_path });
-        copy_lib.step.dependOn(&cargo.step);
-        exe.step.dependOn(&copy_lib.step);
-
-        // Link using relative path - this links by name, not absolute path
-        exe.addObjectFile(.{ .cwd_relative = lib_copy_path });
-
-        // Set RPATH so it can find the library at runtime
-        exe.root_module.addRPathSpecial("$ORIGIN");
-
-        // Clean up the copied file after linking
-        const clean_lib = b.addSystemCommand(&.{ "rm", "-f", lib_copy_path });
-        clean_lib.step.dependOn(&exe.step);
-        b.getInstallStep().dependOn(&clean_lib.step);
+        // Link static Rust library
+        exe.addObjectFile(b.path(rust_lib_path));
+        
+        // Link system libraries required by Rust
+        exe.root_module.linkSystemLibrary("pthread", .{});
+        exe.root_module.linkSystemLibrary("dl", .{});
+        exe.root_module.linkSystemLibrary("m", .{});
+        exe.root_module.linkSystemLibrary("gcc_s", .{});
     } else if (tgt.os.tag == .windows) {
-        exe.addLibraryPath(b.path(rust_out_dir));
-        exe.linkSystemLibrary("astonia_net");
+    exe.addLibraryPath(b.path(rust_out_dir));
+    exe.linkSystemLibrary("astonia_net");
     }
 
     if (tgt.os.tag == .windows) {
@@ -192,9 +261,12 @@ pub fn build(b: *std.Build) void {
         b.getInstallStep().dependOn(&exe_implib_install.?.step);
     }
 
-    const install_rust_dyn = b.addInstallFileWithDir(b.path(rust_dyn_path), .bin, rust_dyn_name);
-    install_rust_dyn.step.dependOn(&cargo.step);
-    b.getInstallStep().dependOn(&install_rust_dyn.step);
+    // Only install dynamic library for Windows (Linux uses static linking)
+    if (tgt.os.tag == .windows) {
+        const install_rust_lib = b.addInstallFileWithDir(b.path(rust_lib_path), .bin, rust_lib_name);
+        install_rust_lib.step.dependOn(&cargo.step);
+        b.getInstallStep().dependOn(&install_rust_lib.step);
+    }
 
     const amod = b.addLibrary(.{
         .name = "amod",
@@ -206,6 +278,7 @@ pub fn build(b: *std.Build) void {
         }),
         .version = .{ .major = 0, .minor = 0, .patch = 0 },
     });
+    amod.want_lto = true; // Enable LTO
 
     if (tgt.os.tag == .linux) {
         amod.linker_allow_shlib_undefined = true;
@@ -219,7 +292,7 @@ pub fn build(b: *std.Build) void {
     amod.root_module.addIncludePath(b.path(include_root));
     amod.root_module.addIncludePath(b.path(src_root));
     addSearchPathsForWindowsTarget(b, amod, tgt, host);
-    linkCommonLibs(b, amod, tgt);
+    linkCommonLibs(b, amod, tgt, zlib, png);
 
     if (tgt.os.tag == .windows) {
         amod.addObjectFile(.{ .generated = .{ .file = exe.generated_implib.? } });
@@ -232,6 +305,7 @@ pub fn build(b: *std.Build) void {
         .name = "anicopy",
         .root_module = b.createModule(.{ .target = resolved, .optimize = optimize, .link_libc = true }),
     });
+    anicopy.want_lto = true; // Enable LTO
     anicopy.addCSourceFile(.{ .file = b.path("src/helper/anicopy.c"), .flags = &.{ "-O3", "-gdwarf-4", "-Wall" } });
     anicopy.root_module.addIncludePath(b.path(include_root));
     anicopy.root_module.addIncludePath(b.path(src_root));
@@ -242,6 +316,7 @@ pub fn build(b: *std.Build) void {
         .name = "convert",
         .root_module = b.createModule(.{ .target = resolved, .optimize = optimize, .link_libc = true }),
     });
+    convert.want_lto = true; // Enable LTO
     convert.addCSourceFile(.{ .file = b.path("src/helper/convert.c"), .flags = &.{ "-O3", "-gdwarf-4", "-Wall", "-DSTANDALONE" } });
     convert.root_module.addIncludePath(b.path(include_root));
     convert.root_module.addIncludePath(b.path(src_root));
@@ -252,7 +327,7 @@ pub fn build(b: *std.Build) void {
         linkSystemLibraryPreferDynamic(b, convert, "zip", tgt);
         linkSystemLibraryPreferDynamic(b, convert, "z", tgt);
     } else if (tgt.os.tag == .linux) {
-        convert.root_module.linkSystemLibrary("png", .{});
+        convert.root_module.linkLibrary(png);
         convert.root_module.linkSystemLibrary("zip", .{});
         convert.root_module.linkSystemLibrary("m", .{});
     }
@@ -263,30 +338,27 @@ pub fn build(b: *std.Build) void {
     b.step("run", "Run moac").dependOn(&run.step);
 }
 
-fn linkCommonLibs(b: *std.Build, step: *std.Build.Step.Compile, tgt: std.Target) void {
+fn linkCommonLibs(b: *std.Build, step: *std.Build.Step.Compile, tgt: std.Target, zlib: *std.Build.Step.Compile, png: *std.Build.Step.Compile) void {
+    // Unified library linking for both platforms
+    // Link our statically-built libraries with LTO enabled
+    step.root_module.linkLibrary(zlib);
+    step.root_module.linkLibrary(png);
+    
+    // Platform-specific system libraries
     if (tgt.os.tag == .windows) {
-        // Windows Makefile library order: -lwsock32 -lws2_32 -lz -lpng -lzip -ldwarfstack $(SDL_LIBS) -lSDL2_mixer
-        // $(SDL_LIBS) expands to: -lmingw32 -mwindows -lSDL2main -lSDL2
-
-        // Static-only libraries (no .dll.a version) - use modern API
+        // Windows-specific libraries
         step.root_module.linkSystemLibrary("wsock32", .{});
         step.root_module.linkSystemLibrary("ws2_32", .{});
         step.root_module.linkSystemLibrary("mingw32", .{});
         step.root_module.linkSystemLibrary("SDL2main", .{});
-
-        // Libraries with both .a and .dll.a versions - use our search function
-        // which prefers .dll.a to avoid static linking and massive dependency chains
-        linkSystemLibraryPreferDynamic(b, step, "z", tgt);
-        linkSystemLibraryPreferDynamic(b, step, "png", tgt);
+        
+        // Libraries that still need system versions
         linkSystemLibraryPreferDynamic(b, step, "zip", tgt);
         linkSystemLibraryPreferDynamic(b, step, "dwarfstack", tgt);
         linkSystemLibraryPreferDynamic(b, step, "SDL2", tgt);
         linkSystemLibraryPreferDynamic(b, step, "SDL2_mixer", tgt);
     } else if (tgt.os.tag == .linux) {
-        // Linux Makefile: -lz -lpng -lzip $(SDL_LIBS) -lSDL2_mixer -lm
-        // Standard linkSystemLibrary works on Linux (already prefers .so)
-        step.root_module.linkSystemLibrary("z", .{});
-        step.root_module.linkSystemLibrary("png", .{});
+        // Linux-specific libraries
         step.root_module.linkSystemLibrary("zip", .{});
         step.root_module.linkSystemLibrary("SDL2", .{});
         step.root_module.linkSystemLibrary("SDL2_mixer", .{});
@@ -439,3 +511,31 @@ fn addSearchPathsForWindowsTarget(
         a.addLibraryPath(.{ .cwd_relative = lib });
     }
 }
+
+const pngSources = &.{
+    "png.c",
+    "pngerror.c",
+    "pngget.c",
+    "pngmem.c",
+    "pngpread.c",
+    "pngread.c",
+    "pngrio.c",
+    "pngrtran.c",
+    "pngrutil.c",
+    "pngset.c",
+    "pngsimd.c",
+    "pngtrans.c",
+    "pngwio.c",
+    "pngwrite.c",
+    "pngwtran.c",
+    "pngwutil.c",
+};
+
+const pngHeaders = &.{
+    "png.h",
+    "pngconf.h",
+    "pngdebug.h",
+    "pnginfo.h",
+    "pngpriv.h",
+    "pngstruct.h",
+};
