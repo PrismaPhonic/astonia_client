@@ -165,6 +165,9 @@ pub fn build(b: *std.Build) void {
         const clean_lib = b.addSystemCommand(&.{ "rm", "-f", lib_copy_path });
         clean_lib.step.dependOn(&exe.step);
         b.getInstallStep().dependOn(&clean_lib.step);
+
+        // Export symbols for amod.so to link against (equivalent to -rdynamic)
+        exe.rdynamic = true;
     } else if (tgt.os.tag == .windows) {
         exe.addLibraryPath(b.path(rust_out_dir));
         exe.linkSystemLibrary("astonia_net");
@@ -185,11 +188,11 @@ pub fn build(b: *std.Build) void {
 
     b.installArtifact(exe);
 
-    var exe_implib_install: ?*std.Build.Step.InstallFile = null;
+    // Install the import library (Windows only - Linux uses runtime symbol resolution)
     if (tgt.os.tag == .windows) {
-        exe_implib_install = b.addInstallFileWithDir(.{ .generated = .{ .file = exe.generated_implib.? } }, .lib, "moac.lib");
-        exe_implib_install.?.step.dependOn(&exe.step);
-        b.getInstallStep().dependOn(&exe_implib_install.?.step);
+        const exe_implib_install = b.addInstallFileWithDir(.{ .generated = .{ .file = exe.generated_implib.? } }, .lib, "moac.lib");
+        exe_implib_install.step.dependOn(&exe.step);
+        b.getInstallStep().dependOn(&exe_implib_install.step);
     }
 
     const install_rust_dyn = b.addInstallFileWithDir(b.path(rust_dyn_path), .bin, rust_dyn_name);
@@ -207,10 +210,7 @@ pub fn build(b: *std.Build) void {
         .version = .{ .major = 0, .minor = 0, .patch = 0 },
     });
 
-    if (tgt.os.tag == .linux) {
-        amod.linker_allow_shlib_undefined = true;
-    }
-
+    // Link amod against the main executable to resolve symbols
     if (tgt.os.tag == .windows) {
         amod.addCSourceFile(.{ .file = b.path("src/amod/amod.c"), .flags = win_cflags });
     } else {
@@ -221,12 +221,18 @@ pub fn build(b: *std.Build) void {
     addSearchPathsForWindowsTarget(b, amod, tgt, host);
     linkCommonLibs(b, amod, tgt);
 
+    // Link amod against the main executable to resolve symbols
     if (tgt.os.tag == .windows) {
+        // Windows: links against the import library (moac.lib)
         amod.addObjectFile(.{ .generated = .{ .file = exe.generated_implib.? } });
         amod.step.dependOn(&exe.step);
+        b.installArtifact(amod);
+    } else {
+        // Linux: install as amod.so (no version suffix) to bin/
+        const amod_install = b.addInstallFileWithDir(amod.getEmittedBin(), .bin, "amod.so");
+        amod_install.step.dependOn(&amod.step);
+        b.getInstallStep().dependOn(&amod_install.step);
     }
-
-    b.installArtifact(amod);
 
     const anicopy = b.addExecutable(.{
         .name = "anicopy",
