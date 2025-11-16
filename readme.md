@@ -67,6 +67,22 @@ docker run --rm -i -e HOST_UID=$(id -u) -e HOST_GID=$(id -g) -v "$PWD:/app" -w /
 
 The built binaries will be in `zig-out/bin/`.
 
+### macOS Build
+Install dependencies via Homebrew:
+```
+brew install zig sdl2 sdl2_mixer libpng zlib libzip
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+rustup target add x86_64-apple-darwin    # Intel
+rustup target add aarch64-apple-darwin   # Apple Silicon
+```
+
+Build:
+```
+zig build --release=fast
+```
+
+The built binaries will be in `zig-out/bin/`.
+
 ### Make A Mod
 ```
 make amod

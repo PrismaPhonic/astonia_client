@@ -25,6 +25,7 @@ pub fn build(b: *std.Build) void {
     const rust_dyn_name = switch (tgt.os.tag) {
         .windows => "astonia_net.dll",
         .linux => "libastonia_net.so",
+        .macos => "libastonia_net.dylib",
         else => "libastonia_net.so",
     };
     const rust_dyn_path = b.pathJoin(&.{ rust_out_dir, rust_dyn_name });
@@ -74,6 +75,10 @@ pub fn build(b: *std.Build) void {
 
     const linux_sources = &.{
         "src/game/memory_linux.c",
+    };
+
+    const macos_sources = &.{
+        "src/game/memory_macos.c",
     };
 
     const base_cflags = &.{
@@ -128,6 +133,15 @@ pub fn build(b: *std.Build) void {
                 "-fno-omit-frame-pointer", "-fvisibility=hidden",
             },
         });
+    } else if (tgt.os.tag == .macos) {
+        exe.addCSourceFiles(.{
+            .files = macos_sources,
+            .flags = &.{
+                "-O3",                     "-gdwarf-4",            "-Wall",
+                "-Wno-pointer-sign",       "-Wno-char-subscripts", "-fPIC",
+                "-fno-omit-frame-pointer", "-fvisibility=hidden",
+            },
+        });
     }
 
     // Allow __DATE__/__TIME__ (warning rather than error)
@@ -145,7 +159,7 @@ pub fn build(b: *std.Build) void {
 
     exe.step.dependOn(&cargo.step);
 
-    if (tgt.os.tag == .linux) {
+    if (tgt.os.tag == .linux or tgt.os.tag == .macos) {
         // Workaround: Copy library to current directory and link with relative path
         // This avoids embedding absolute paths in NEEDED entries
         const lib_copy_path = rust_dyn_name; // Copy to current directory
@@ -159,14 +173,19 @@ pub fn build(b: *std.Build) void {
         exe.addObjectFile(.{ .cwd_relative = lib_copy_path });
 
         // Set RPATH so it can find the library at runtime
-        exe.root_module.addRPathSpecial("$ORIGIN");
+        // macOS uses @loader_path, Linux uses $ORIGIN
+        if (tgt.os.tag == .macos) {
+            exe.root_module.addRPathSpecial("@loader_path");
+        } else {
+            exe.root_module.addRPathSpecial("$ORIGIN");
+        }
 
         // Clean up the copied file after linking
         const clean_lib = b.addSystemCommand(&.{ "rm", "-f", lib_copy_path });
         clean_lib.step.dependOn(&exe.step);
         b.getInstallStep().dependOn(&clean_lib.step);
 
-        // Export symbols for amod.so to link against (equivalent to -rdynamic)
+        // Export symbols for amod to link against (equivalent to -rdynamic)
         exe.rdynamic = true;
     } else if (tgt.os.tag == .windows) {
         exe.addLibraryPath(b.path(rust_out_dir));
@@ -227,8 +246,16 @@ pub fn build(b: *std.Build) void {
         amod.addObjectFile(.{ .generated = .{ .file = exe.generated_implib.? } });
         amod.step.dependOn(&exe.step);
         b.installArtifact(amod);
+    } else if (tgt.os.tag == .macos) {
+        // macOS: allow undefined references to resolve against the main executable at runtime
+        amod.linker_allow_shlib_undefined = true;
+        amod.step.dependOn(&exe.step);
+        const amod_install = b.addInstallFileWithDir(amod.getEmittedBin(), .bin, "amod.dylib");
+        amod_install.step.dependOn(&amod.step);
+        b.getInstallStep().dependOn(&amod_install.step);
     } else {
         // Linux: install as amod.so (no version suffix) to bin/
+        amod.step.dependOn(&exe.step);
         const amod_install = b.addInstallFileWithDir(amod.getEmittedBin(), .bin, "amod.so");
         amod_install.step.dependOn(&amod.step);
         b.getInstallStep().dependOn(&amod_install.step);
@@ -257,7 +284,7 @@ pub fn build(b: *std.Build) void {
         linkSystemLibraryPreferDynamic(b, convert, "png", tgt);
         linkSystemLibraryPreferDynamic(b, convert, "zip", tgt);
         linkSystemLibraryPreferDynamic(b, convert, "z", tgt);
-    } else if (tgt.os.tag == .linux) {
+    } else if (tgt.os.tag == .linux or tgt.os.tag == .macos) {
         convert.root_module.linkSystemLibrary("png", .{});
         convert.root_module.linkSystemLibrary("zip", .{});
         convert.root_module.linkSystemLibrary("m", .{});
@@ -288,9 +315,8 @@ fn linkCommonLibs(b: *std.Build, step: *std.Build.Step.Compile, tgt: std.Target)
         linkSystemLibraryPreferDynamic(b, step, "dwarfstack", tgt);
         linkSystemLibraryPreferDynamic(b, step, "SDL2", tgt);
         linkSystemLibraryPreferDynamic(b, step, "SDL2_mixer", tgt);
-    } else if (tgt.os.tag == .linux) {
-        // Linux Makefile: -lz -lpng -lzip $(SDL_LIBS) -lSDL2_mixer -lm
-        // Standard linkSystemLibrary works on Linux (already prefers .so)
+    } else {
+        // Linux or OSX
         step.root_module.linkSystemLibrary("z", .{});
         step.root_module.linkSystemLibrary("png", .{});
         step.root_module.linkSystemLibrary("zip", .{});
@@ -405,7 +431,12 @@ fn rustTripleFor(t: std.Target) []const u8 {
         .x86_64 => switch (t.os.tag) {
             .linux => "x86_64-unknown-linux-gnu",
             .windows => "x86_64-pc-windows-gnu",
+            .macos => "x86_64-apple-darwin",
             else => @panic("unsupported OS for x86_64"),
+        },
+        .aarch64 => switch (t.os.tag) {
+            .macos => "aarch64-apple-darwin",
+            else => @panic("unsupported OS for aarch64"),
         },
         else => @panic("unsupported arch"),
     };
